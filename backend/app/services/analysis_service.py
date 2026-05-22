@@ -1,16 +1,11 @@
-"""Service for AI-powered content analysis.
+"""Service for AI-powered content analysis using local models.
 
-Responsibilities:
-- Detect filler words in transcript segments
-- Identify silence gaps between words
-- Find repeated takes / duplicate content using Claude API
-- Assign quality scores to segments
+Uses sentence-transformers for duplicate detection (no API keys needed).
+Falls back to TF-IDF cosine similarity if sentence-transformers is not installed.
 """
 
 import logging
 import uuid
-
-import anthropic
 
 from app.config import settings
 from app.models.segment import TranscriptSegment
@@ -22,12 +17,60 @@ DEFAULT_FILLER_WORDS = [
     "literally", "sort of", "kind of", "I mean", "right", "so",
 ]
 
+SIMILARITY_THRESHOLD = 0.78
+
 
 class AnalysisService:
     """Analyzes transcript segments for fillers, silence, and duplicates."""
 
     def __init__(self) -> None:
-        self.anthropic_api_key = settings.ANTHROPIC_API_KEY
+        self._similarity_model = None
+        self._backend = None
+
+    def _get_similarity_model(self):
+        """Lazy-load the sentence-transformers model."""
+        if self._similarity_model is not None:
+            return self._similarity_model
+
+        try:
+            from sentence_transformers import SentenceTransformer
+            self._similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
+            self._backend = "sentence_transformers"
+            logger.info("Loaded sentence-transformers model (all-MiniLM-L6-v2)")
+        except ImportError:
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                from sklearn.metrics.pairwise import cosine_similarity
+                self._similarity_model = "tfidf"
+                self._backend = "tfidf"
+                logger.info("Using TF-IDF fallback for similarity")
+            except ImportError:
+                logger.warning("No similarity model available, skipping duplicate detection")
+                self._similarity_model = "none"
+                self._backend = "none"
+
+        return self._similarity_model
+
+    def _compute_similarity(self, text1: str, text2: str) -> float:
+        """Compute semantic similarity between two texts (0.0 to 1.0)."""
+        model = self._get_similarity_model()
+
+        if self._backend == "sentence_transformers":
+            from sentence_transformers import util
+            emb1 = model.encode(text1, convert_to_tensor=True)
+            emb2 = model.encode(text2, convert_to_tensor=True)
+            score = util.cos_sim(emb1, emb2).item()
+            return max(0.0, min(1.0, score))
+
+        elif self._backend == "tfidf":
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.metrics.pairwise import cosine_similarity
+            vectorizer = TfidfVectorizer()
+            tfidf = vectorizer.fit_transform([text1, text2])
+            score = cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0]
+            return float(score)
+
+        return 0.0
 
     def detect_fillers(
         self,
@@ -35,22 +78,13 @@ class AnalysisService:
         filler_words: list[str] | None = None,
         silence_threshold_ms: int = 500,
     ) -> list[dict]:
-        """Scan word_timestamps in segments for filler words and silence gaps.
+        """Scan word_timestamps for filler words and silence gaps.
 
-        Args:
-            segments: List of TranscriptSegment model instances.
-            filler_words: List of filler word strings to detect.
-            silence_threshold_ms: Gap between words in ms that counts as silence.
-
-        Returns:
-            List of dicts describing filler/silence detections with segment updates.
-            Each dict has: segment_id, updates (dict of field changes),
-            or new_segments (list of new sub-segments to create).
+        Returns list of dicts describing filler/silence detections.
         """
         if filler_words is None:
             filler_words = DEFAULT_FILLER_WORDS
 
-        # Normalize filler words for matching
         filler_set = {fw.lower().strip() for fw in filler_words}
         results: list[dict] = []
 
@@ -63,7 +97,7 @@ class AnalysisService:
             if not words:
                 continue
 
-            # Check for filler words in this segment's word timestamps
+            # Check for filler words
             filler_detected = False
             for word_info in words:
                 word_text = word_info.get("word", "").lower().strip().rstrip(".,!?;:")
@@ -71,7 +105,7 @@ class AnalysisService:
                     filler_detected = True
                     break
 
-            # Check for multi-word fillers (e.g., "you know", "sort of")
+            # Multi-word fillers
             if not filler_detected:
                 text_lower = segment.text.lower()
                 for filler in filler_set:
@@ -89,7 +123,7 @@ class AnalysisService:
                     },
                 })
 
-            # Detect silence gaps between words within this segment
+            # Detect silence gaps
             silence_segments = self._detect_silence_gaps(segment, words, silence_threshold_ms)
             results.extend(silence_segments)
 
@@ -101,10 +135,7 @@ class AnalysisService:
         words: list[dict],
         threshold_ms: int,
     ) -> list[dict]:
-        """Find silence gaps between words within a segment.
-
-        Returns list of new silence sub-segment definitions.
-        """
+        """Find silence gaps between words within a segment."""
         silence_results: list[dict] = []
 
         for i in range(len(words) - 1):
@@ -133,44 +164,26 @@ class AnalysisService:
         segments: list[TranscriptSegment],
         project_id: str,
     ) -> list[dict]:
-        """Detect semantically similar consecutive passages using Claude API.
+        """Detect semantically similar consecutive passages using local embeddings.
 
-        Groups consecutive segments by speaker, then uses Claude to identify
-        repeated takes (where the speaker says essentially the same thing twice).
-
-        Args:
-            segments: List of TranscriptSegment instances, ordered by time.
-            project_id: The project ID.
-
-        Returns:
-            List of dicts with segment_id and updates for duplicate detection.
+        Uses sentence-transformers cosine similarity instead of Claude API.
         """
-        if not self.anthropic_api_key:
-            logger.warning("ANTHROPIC_API_KEY not set, skipping duplicate detection")
+        model = self._get_similarity_model()
+        if self._backend == "none":
+            logger.warning("No similarity model available, skipping duplicate detection")
             return []
 
         if len(segments) < 2:
             return []
 
-        # Group consecutive segments by speaker
         speaker_groups = self._group_by_speaker(segments)
         results: list[dict] = []
 
-        try:
-            client = anthropic.AsyncAnthropic(api_key=self.anthropic_api_key)
-
-            for group in speaker_groups:
-                if len(group) < 2:
-                    continue
-
-                # Compare consecutive passages within the speaker group
-                duplicates = await self._find_duplicates_in_group(client, group)
-                results.extend(duplicates)
-
-        except anthropic.APIError as e:
-            logger.error("Anthropic API error during duplicate detection: %s", str(e))
-        except Exception:
-            logger.exception("Unexpected error during duplicate detection")
+        for group in speaker_groups:
+            if len(group) < 2:
+                continue
+            duplicates = self._find_duplicates_in_group(group)
+            results.extend(duplicates)
 
         return results
 
@@ -197,130 +210,61 @@ class AnalysisService:
 
         return groups
 
-    async def _find_duplicates_in_group(
+    def _find_duplicates_in_group(
         self,
-        client: anthropic.AsyncAnthropic,
         group: list[TranscriptSegment],
     ) -> list[dict]:
-        """Use Claude to detect semantically similar passages in a speaker group."""
+        """Find duplicate takes within a speaker group using embedding similarity."""
         results: list[dict] = []
 
-        # Build passage pairs to compare
-        passages = []
-        for seg in group:
-            passages.append({"id": seg.id, "text": seg.text, "segment": seg})
-
-        # Compare consecutive passages
-        for i in range(len(passages) - 1):
-            p1 = passages[i]
-            p2 = passages[i + 1]
+        for i in range(len(group) - 1):
+            p1 = group[i]
+            p2 = group[i + 1]
 
             # Skip very short passages
-            if len(p1["text"].split()) < 5 or len(p2["text"].split()) < 5:
+            if len(p1.text.split()) < 5 or len(p2.text.split()) < 5:
                 continue
 
-            is_duplicate = await self._compare_passages(client, p1["text"], p2["text"])
+            # Skip if more than 30 seconds apart (unlikely to be retakes)
+            if p2.start_ms - p1.end_ms > 30000:
+                continue
 
-            if is_duplicate:
+            similarity = self._compute_similarity(p1.text, p2.text)
+
+            if similarity >= SIMILARITY_THRESHOLD:
                 dup_group_id = str(uuid.uuid4())
 
-                # Mark the first one as cut (keep the LAST take)
+                # Cut the first take, keep the last
                 results.append({
-                    "segment_id": p1["id"],
+                    "segment_id": p1.id,
                     "updates": {
                         "duplicate_group_id": dup_group_id,
                         "cut_decision": "cut",
-                        "cut_reason": "repeated take",
+                        "cut_reason": f"repeated take (similarity: {similarity:.0%})",
+                        "quality_score": similarity,
                     },
                 })
 
-                # Mark the second one as kept duplicate
                 results.append({
-                    "segment_id": p2["id"],
+                    "segment_id": p2.id,
                     "updates": {
                         "duplicate_group_id": dup_group_id,
-                        # Keep the last take
+                        "quality_score": similarity,
                     },
                 })
 
         return results
 
-    async def _compare_passages(
-        self, client: anthropic.AsyncAnthropic, text1: str, text2: str
-    ) -> bool:
-        """Ask Claude if two passages express the same idea (repeated take)."""
-        prompt = (
-            "You are analyzing video transcript segments to detect repeated takes. "
-            "A repeated take is when a speaker says essentially the same thing twice, "
-            "as if they are re-recording or re-stating the same point.\n\n"
-            f"Passage 1: \"{text1}\"\n\n"
-            f"Passage 2: \"{text2}\"\n\n"
-            "Do these two passages express the same core idea, as if the speaker "
-            "is taking another attempt at saying the same thing? "
-            "Answer ONLY 'yes' or 'no'."
-        )
-
-        try:
-            response = await client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=10,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            answer = response.content[0].text.strip().lower()
-            return answer.startswith("yes")
-
-        except Exception:
-            logger.exception("Error comparing passages with Claude")
-            return False
-
-    async def detect_fillers_for_project(
-        self, project_id: str
-    ) -> int:
-        """Scan segments for filler words and mark them.
-
-        This is a convenience alias used by older code paths.
-        The actual logic runs via detect_fillers() with segments passed in.
-
-        Args:
-            project_id: The project to analyze.
-
-        Returns:
-            Number of filler segments detected.
-        """
+    async def detect_fillers_for_project(self, project_id: str) -> int:
         raise NotImplementedError("Use detect_fillers() with segments from the worker")
 
     async def detect_silence(self, project_id: str) -> int:
-        """Identify silence gaps exceeding the project threshold.
-
-        Args:
-            project_id: The project to analyze.
-
-        Returns:
-            Number of silence segments created.
-        """
         raise NotImplementedError("Use detect_fillers() which includes silence detection")
 
     async def detect_duplicates(self, project_id: str) -> int:
-        """Use Claude API to find repeated takes of the same content.
-
-        Args:
-            project_id: The project to analyze.
-
-        Returns:
-            Number of duplicate groups found.
-        """
         raise NotImplementedError("Use detect_repeated_takes() from the worker")
 
     async def analyze_project(self, project_id: str) -> dict:
-        """Run full analysis pipeline on a project.
-
-        Args:
-            project_id: The project to analyze.
-
-        Returns:
-            Summary dict with counts of each detection type.
-        """
         raise NotImplementedError("Use the task queue worker for full analysis")
 
 
