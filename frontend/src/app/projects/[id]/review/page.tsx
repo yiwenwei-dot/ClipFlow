@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/Button";
 import { SpeakerLabel } from "@/components/transcript/SpeakerLabel";
 import type { TranscriptSegment, Speaker } from "@/lib/types";
 import { api } from "@/lib/api-client";
+import { useToastStore } from "@/stores/toast-store";
 
 function formatTime(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -15,12 +16,22 @@ function formatTime(ms: number): string {
   return `${m}:${String(s % 60).padStart(2, "0")}`;
 }
 
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 export default function ReviewPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const router = useRouter();
+  const addToast = useToastStore((s) => s.addToast);
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [speakers, setSpeakers] = useState<Speaker[]>([]);
   const [loading, setLoading] = useState(true);
+  const [rendering, setRendering] = useState(false);
 
   useEffect(() => {
     Promise.all([
@@ -29,8 +40,11 @@ export default function ReviewPage({ params }: { params: Promise<{ id: string }>
     ]).then(([segs]) => {
       setSegments(segs);
       setLoading(false);
-    }).catch(() => setLoading(false));
-  }, [id]);
+    }).catch((e) => {
+      setLoading(false);
+      addToast({ type: "error", message: `Failed to load transcript: ${e.message}` });
+    });
+  }, [id, addToast]);
 
   const toggleSegment = (segmentId: string) => {
     setSegments((prev) =>
@@ -40,7 +54,9 @@ export default function ReviewPage({ params }: { params: Promise<{ id: string }>
           seg.cut_decision === "keep" || seg.cut_decision === "user_restored"
             ? "user_cut"
             : "user_restored";
-        api.updateSegment(segmentId, { cut_decision: newDecision });
+        api.updateSegment(id, segmentId, { cut_decision: newDecision }).catch((e) => {
+          addToast({ type: "error", message: `Failed to update segment: ${e.message}` });
+        });
         return { ...seg, cut_decision: newDecision as TranscriptSegment["cut_decision"] };
       })
     );
@@ -50,11 +66,11 @@ export default function ReviewPage({ params }: { params: Promise<{ id: string }>
     setSegments((prev) =>
       prev.map((seg) => {
         if (seg.cut_decision === "user_cut") {
-          api.updateSegment(seg.id, { cut_decision: "keep" });
+          api.updateSegment(id, seg.id, { cut_decision: "keep" });
           return { ...seg, cut_decision: "keep" };
         }
         if (seg.cut_decision === "user_restored") {
-          api.updateSegment(seg.id, { cut_decision: "cut" });
+          api.updateSegment(id, seg.id, { cut_decision: "cut" });
           return { ...seg, cut_decision: "cut" };
         }
         return seg;
@@ -62,18 +78,43 @@ export default function ReviewPage({ params }: { params: Promise<{ id: string }>
     );
   };
 
-  const skipReview = () => {
-    router.push(`/projects/${id}/export`);
+  const skipReview = async () => {
+    setRendering(true);
+    try {
+      await api.startRender(id);
+      router.push(`/projects/${id}/export`);
+    } catch (e) {
+      setRendering(false);
+      const error = e instanceof Error ? e.message : "Render failed";
+      addToast({ type: "error", message: `Failed to start render: ${error}` });
+    }
   };
 
   const finishReview = async () => {
-    await api.startRender(id);
-    router.push(`/projects/${id}/export`);
+    setRendering(true);
+    try {
+      await api.startRender(id);
+      router.push(`/projects/${id}/export`);
+    } catch (e) {
+      setRendering(false);
+      const error = e instanceof Error ? e.message : "Render failed";
+      addToast({ type: "error", message: `Failed to start render: ${error}` });
+    }
   };
 
   const speakerMap = new Map(speakers.map((s) => [s.id, s]));
-  const keptCount = segments.filter((s) => s.cut_decision === "keep" || s.cut_decision === "user_restored").length;
-  const cutCount = segments.filter((s) => s.cut_decision === "cut" || s.cut_decision === "user_cut").length;
+  const keptSegments = segments.filter((s) => s.cut_decision === "keep" || s.cut_decision === "user_restored");
+  const cutSegments = segments.filter((s) => s.cut_decision === "cut" || s.cut_decision === "user_cut");
+  const keptCount = keptSegments.length;
+  const cutCount = cutSegments.length;
+
+  // Duration calculations
+  const totalDurationMs = segments.reduce((sum, s) => sum + (s.end_ms - s.start_ms), 0);
+  const keptDurationMs = keptSegments.reduce((sum, s) => sum + (s.end_ms - s.start_ms), 0);
+  const cutDurationMs = cutSegments.reduce((sum, s) => sum + (s.end_ms - s.start_ms), 0);
+  const percentRemoved = totalDurationMs > 0
+    ? Math.round((cutDurationMs / totalDurationMs) * 100)
+    : 0;
 
   if (loading) {
     return (
@@ -91,10 +132,10 @@ export default function ReviewPage({ params }: { params: Promise<{ id: string }>
             <ArrowLeft size={16} /> Back to project
           </Link>
           <div className="flex items-center gap-3">
-            <Button variant="ghost" size="sm" onClick={skipReview}>
+            <Button variant="ghost" size="sm" onClick={skipReview} loading={rendering}>
               <SkipForward size={16} className="mr-1.5" /> Skip Review
             </Button>
-            <Button onClick={finishReview}>
+            <Button onClick={finishReview} loading={rendering}>
               Looks Good <ArrowRight size={16} className="ml-1.5" />
             </Button>
           </div>
@@ -106,8 +147,33 @@ export default function ReviewPage({ params }: { params: Promise<{ id: string }>
           <h2 className="text-xl font-semibold text-gray-100 mb-2">Review Your Edit</h2>
           <p className="text-sm text-gray-500 mb-4">
             Click any text to remove or restore it. Strikethrough text will be cut from the final video.
-            You can skip this step if you trust the AI's decisions.
+            You can skip this step if you trust the AI decisions.
           </p>
+
+          {/* Summary banner */}
+          {segments.length > 0 && (
+            <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-4">
+              <div className="grid grid-cols-4 gap-4 text-center">
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">Original</p>
+                  <p className="text-sm font-medium text-gray-200">{formatDuration(totalDurationMs)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">After cuts</p>
+                  <p className="text-sm font-medium text-green-400">{formatDuration(keptDurationMs)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">Removed</p>
+                  <p className="text-sm font-medium text-red-400">{formatDuration(cutDurationMs)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">% removed</p>
+                  <p className="text-sm font-medium text-yellow-400">{percentRemoved}%</p>
+                </div>
+              </div>
+            </div>
+          )}
+
           <div className="flex items-center gap-4 text-sm">
             <span className="text-green-400">{keptCount} segments kept</span>
             <span className="text-red-400">{cutCount} segments cut</span>
@@ -168,10 +234,10 @@ export default function ReviewPage({ params }: { params: Promise<{ id: string }>
         </div>
 
         <div className="mt-10 flex items-center justify-between border-t border-gray-800 pt-6">
-          <Button variant="ghost" onClick={skipReview}>
+          <Button variant="ghost" onClick={skipReview} loading={rendering}>
             <SkipForward size={16} className="mr-1.5" /> Skip & Render
           </Button>
-          <Button onClick={finishReview} size="lg">
+          <Button onClick={finishReview} size="lg" loading={rendering}>
             Approve & Render <ArrowRight size={16} className="ml-1.5" />
           </Button>
         </div>

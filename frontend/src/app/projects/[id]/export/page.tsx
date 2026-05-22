@@ -1,13 +1,14 @@
 "use client";
 
-import { useState, useEffect, use } from "react";
-import { ArrowLeft, Download, CheckCircle } from "lucide-react";
+import { useState, useEffect, useRef, use } from "react";
+import { ArrowLeft, Download, CheckCircle, Edit } from "lucide-react";
 import Link from "next/link";
 import { Button } from "@/components/ui/Button";
 import { ProgressBar } from "@/components/ui/ProgressBar";
 import { Spinner } from "@/components/ui/Spinner";
 import type { VideoExport } from "@/lib/types";
 import { api } from "@/lib/api-client";
+import { useToastStore } from "@/stores/toast-store";
 
 function formatSize(bytes: number | null): string {
   if (!bytes) return "";
@@ -25,27 +26,88 @@ function formatDuration(ms: number | null): string {
 
 export default function ExportPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
+  const addToast = useToastStore((s) => s.addToast);
   const [exports, setExports] = useState<VideoExport[]>([]);
   const [rendering, setRendering] = useState(false);
   const [progress, setProgress] = useState(0);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const checkRenderStatus = async () => {
+    try {
+      const status = await api.getProcessingStatus(id);
+      const renderJob = status.jobs.find(
+        (j) => j.job_type === "render" && (j.status === "queued" || j.status === "running")
+      );
+
+      if (renderJob) {
+        setRendering(true);
+        setProgress(renderJob.progress_pct);
+      } else {
+        // Rendering done or no render job
+        setRendering(false);
+        // Refresh exports list
+        const exps = await api.getExports(id);
+        setExports(exps);
+        // Stop polling
+        if (pollRef.current) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+      }
+    } catch {
+      // Ignore polling errors
+    }
+  };
 
   useEffect(() => {
+    // Initial load
     api.getExports(id).then(setExports).catch(() => {});
 
-    const status = api.getProcessingStatus(id).then((job) => {
-      if (job.status === "running" && job.job_type === "render") {
+    api.getProcessingStatus(id).then((status) => {
+      const renderJob = status.jobs.find(
+        (j) => j.job_type === "render" && (j.status === "queued" || j.status === "running")
+      );
+      if (renderJob) {
         setRendering(true);
-        setProgress(job.progress_pct);
+        setProgress(renderJob.progress_pct);
+        // Start polling
+        pollRef.current = setInterval(checkRenderStatus, 3000);
       }
     }).catch(() => {});
+
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  // Start polling when rendering is detected
+  useEffect(() => {
+    if (rendering && !pollRef.current) {
+      pollRef.current = setInterval(checkRenderStatus, 3000);
+    }
+    return () => {
+      if (!rendering && pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rendering]);
 
   return (
     <div className="min-h-screen">
       <header className="border-b border-gray-800 px-8 py-4">
-        <div className="max-w-4xl mx-auto">
+        <div className="max-w-4xl mx-auto flex items-center justify-between">
           <Link href={`/projects/${id}`} className="flex items-center gap-2 text-gray-400 hover:text-gray-200 text-sm">
             <ArrowLeft size={16} /> Back to project
+          </Link>
+          <Link href={`/projects/${id}`}>
+            <Button variant="ghost" size="sm">
+              <Edit size={16} className="mr-1.5" /> Back to Editor
+            </Button>
           </Link>
         </div>
       </header>
@@ -77,7 +139,7 @@ export default function ExportPage({ params }: { params: Promise<{ id: string }>
                     </p>
                   </div>
                 </div>
-                <a href={api.getExportDownloadUrl(exp.id)} download>
+                <a href={api.getExportDownloadUrl(id, exp.id)} download>
                   <Button variant="secondary" size="sm">
                     <Download size={16} className="mr-1.5" /> Download
                   </Button>
@@ -89,6 +151,11 @@ export default function ExportPage({ params }: { params: Promise<{ id: string }>
           <div className="text-center py-16 text-gray-500 space-y-2">
             <p>No exports yet</p>
             <p className="text-xs text-gray-600">Go to Review to approve your edit and start rendering</p>
+            <Link href={`/projects/${id}/review`}>
+              <Button variant="secondary" size="sm" className="mt-4">
+                Go to Review
+              </Button>
+            </Link>
           </div>
         ) : null}
       </main>

@@ -63,6 +63,7 @@ export interface ProcessingJob {
   error_message: string | null;
   started_at: string | null;
   completed_at: string | null;
+  created_at?: string;
 }
 
 export interface VideoExport {

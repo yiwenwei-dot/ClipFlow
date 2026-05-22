@@ -6,6 +6,7 @@ interface TranscriptStore {
   segments: TranscriptSegment[];
   speakers: Speaker[];
   loading: boolean;
+  projectId: string | null;
   fetchTranscript: (projectId: string) => Promise<void>;
   toggleSegmentCut: (segmentId: string) => void;
   updateSegment: (segmentId: string, cutDecision: string) => Promise<void>;
@@ -16,9 +17,10 @@ export const useTranscriptStore = create<TranscriptStore>((set, get) => ({
   segments: [],
   speakers: [],
   loading: false,
+  projectId: null,
 
   fetchTranscript: async (projectId: string) => {
-    set({ loading: true });
+    set({ loading: true, projectId });
     try {
       const segments = await api.getTranscript(projectId);
       set({ segments, loading: false });
@@ -28,6 +30,7 @@ export const useTranscriptStore = create<TranscriptStore>((set, get) => ({
   },
 
   toggleSegmentCut: (segmentId: string) => {
+    const { projectId } = get();
     const segments = get().segments.map((seg) => {
       if (seg.id !== segmentId) return seg;
       const newDecision =
@@ -38,12 +41,13 @@ export const useTranscriptStore = create<TranscriptStore>((set, get) => ({
     });
     set({ segments });
     const segment = segments.find((s) => s.id === segmentId);
-    if (segment) {
-      api.updateSegment(segmentId, { cut_decision: segment.cut_decision });
+    if (segment && projectId) {
+      api.updateSegment(projectId, segmentId, { cut_decision: segment.cut_decision });
     }
   },
 
   updateSegment: async (segmentId: string, cutDecision: string) => {
+    const { projectId } = get();
     set((state) => ({
       segments: state.segments.map((seg) =>
         seg.id === segmentId
@@ -51,7 +55,9 @@ export const useTranscriptStore = create<TranscriptStore>((set, get) => ({
           : seg
       ),
     }));
-    await api.updateSegment(segmentId, { cut_decision: cutDecision });
+    if (projectId) {
+      await api.updateSegment(projectId, segmentId, { cut_decision: cutDecision });
+    }
   },
 
   setSpeakers: (speakers) => set({ speakers }),

@@ -16,6 +16,11 @@ function formatSize(bytes: number | null): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatResolution(width: number | null, height: number | null): string {
+  if (!width || !height) return "";
+  return `${width}x${height}`;
+}
+
 interface ClipCardProps {
   clip: Clip;
   onDelete?: () => void;
@@ -23,6 +28,13 @@ interface ClipCardProps {
 }
 
 export function ClipCard({ clip, onDelete, dragHandleProps }: ClipCardProps) {
+  const resolution = formatResolution(clip.width, clip.height);
+  const meta: string[] = [];
+  meta.push(formatDuration(clip.duration_ms));
+  if (resolution) meta.push(resolution);
+  if (clip.fps) meta.push(`${clip.fps}fps`);
+  if (clip.file_size_bytes) meta.push(formatSize(clip.file_size_bytes));
+
   return (
     <div className="flex items-center gap-3 bg-gray-900 border border-gray-800 rounded-lg p-3 group">
       <div {...dragHandleProps} className="cursor-grab text-gray-600 hover:text-gray-400">
@@ -34,8 +46,7 @@ export function ClipCard({ clip, onDelete, dragHandleProps }: ClipCardProps) {
       <div className="flex-1 min-w-0">
         <p className="text-sm text-gray-200 truncate">{clip.filename}</p>
         <p className="text-xs text-gray-500">
-          {formatDuration(clip.duration_ms)}
-          {clip.file_size_bytes ? ` · ${formatSize(clip.file_size_bytes)}` : ""}
+          {meta.filter(Boolean).join(" · ")}
         </p>
       </div>
       {onDelete && (
