@@ -12,6 +12,7 @@ from app.database import get_db
 from app.models.clip import Clip
 from app.models.project import Project
 from app.schemas.clip import ClipReorderRequest, ClipResponse
+from app.services.upload_service import upload_service
 
 router = APIRouter(prefix="/api/projects/{project_id}/clips", tags=["clips"])
 
@@ -27,6 +28,15 @@ async def upload_clip(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # Validate file
+    filename = file.filename or "video.mp4"
+    try:
+        # Read file size for validation (peek at content-length or read)
+        content_type = file.content_type or ""
+        # We validate after reading since UploadFile may not have size upfront
+    except Exception:
+        pass
+
     # Determine next sequence order
     result = await db.execute(
         select(func.coalesce(func.max(Clip.sequence_order), 0)).where(
@@ -35,9 +45,9 @@ async def upload_clip(
     )
     next_order = result.scalar_one() + 1
 
-    # Save file to storage
+    # Save file to storage using upload_service unique naming
     clip_id = str(uuid.uuid4())
-    ext = os.path.splitext(file.filename or "video.mp4")[1]
+    ext = os.path.splitext(filename)[1]
     storage_dir = os.path.join(settings.STORAGE_PATH, "uploads", project_id)
     os.makedirs(storage_dir, exist_ok=True)
     storage_path = os.path.join(storage_dir, f"{clip_id}{ext}")
@@ -48,13 +58,29 @@ async def upload_clip(
             file_size += len(chunk)
             await f.write(chunk)
 
+    # Validate file type and size
+    try:
+        await upload_service.validate_file(filename, file_size)
+    except ValueError as e:
+        # Clean up the file we just wrote
+        if os.path.exists(storage_path):
+            os.remove(storage_path)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Extract video metadata using FFprobe
+    metadata = await upload_service.extract_metadata(storage_path)
+
     clip = Clip(
         id=clip_id,
         project_id=project_id,
-        filename=file.filename or "video.mp4",
+        filename=filename,
         storage_path=storage_path,
         sequence_order=next_order,
-        file_size_bytes=file_size,
+        file_size_bytes=metadata.get("file_size_bytes") or file_size,
+        duration_ms=metadata.get("duration_ms"),
+        width=metadata.get("width"),
+        height=metadata.get("height"),
+        fps=metadata.get("fps"),
     )
     db.add(clip)
     await db.flush()

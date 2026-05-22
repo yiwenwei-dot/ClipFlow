@@ -1,7 +1,7 @@
 import os
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -9,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.export import Export
+from app.models.processing_job import ProcessingJob
 from app.models.project import Project
+from app.workers.task_queue import run_render_pipeline
 
 router = APIRouter(prefix="/api/projects/{project_id}/exports", tags=["exports"])
 
@@ -35,13 +37,32 @@ class ExportResponse(BaseModel):
 async def start_export(
     project_id: str,
     data: ExportRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> Export:
-    """Start an export/render job. Stubbed -- creates the export record."""
+    """Start an export/render job.
+
+    Creates a ProcessingJob to track progress and launches the render pipeline
+    in the background. The Export record is created by the merge_service once
+    rendering completes.
+    """
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # Create a processing job to track the render
+    from datetime import datetime, timezone
+
+    job = ProcessingJob(
+        id=str(uuid.uuid4()),
+        project_id=project_id,
+        job_type="render",
+        status="queued",
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(job)
+
+    # Create a placeholder export record so we can return it immediately
     export_id = str(uuid.uuid4())
     storage_path = os.path.join("storage", "exports", f"{export_id}.{data.format}")
 
@@ -55,6 +76,10 @@ async def start_export(
     db.add(export)
     await db.flush()
     await db.refresh(export)
+
+    # Launch render in background
+    background_tasks.add_task(run_render_pipeline, project_id, job.id)
+
     return export
 
 
