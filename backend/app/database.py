@@ -1,3 +1,5 @@
+from collections.abc import AsyncGenerator
+
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -11,7 +13,7 @@ class Base(DeclarativeBase):
     pass
 
 
-async def get_db() -> AsyncSession:  # type: ignore[misc]
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """Dependency that yields an async database session."""
     async with async_session_factory() as session:
         try:
@@ -24,5 +26,8 @@ async def get_db() -> AsyncSession:  # type: ignore[misc]
 
 async def init_db() -> None:
     """Create all tables (used during development; Alembic handles migrations in production)."""
+    # Import all models so they are registered with Base.metadata
+    import app.models  # noqa: F401
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
