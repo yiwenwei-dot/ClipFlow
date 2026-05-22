@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import tempfile
 import uuid
 
@@ -235,7 +236,6 @@ class FFmpegService:
 
         if len(segment_paths) == 1:
             # Just copy the single file
-            import shutil
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, shutil.copy2, segment_paths[0], output_path)
@@ -353,7 +353,6 @@ class FFmpegService:
 
         finally:
             # Clean up temp files
-            import shutil
             try:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception:

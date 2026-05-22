@@ -1,5 +1,6 @@
 import os
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import FileResponse
@@ -51,8 +52,6 @@ async def start_export(
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Create a processing job to track the render
-    from datetime import datetime, timezone
-
     job = ProcessingJob(
         id=str(uuid.uuid4()),
         project_id=project_id,
